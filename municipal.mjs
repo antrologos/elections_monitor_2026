@@ -84,9 +84,15 @@ export async function collectMunicipal({ dataDir, fetchImpl = fetch, now = Date.
   async function get(url, started = () => {}) {
     if (stopped()) throw new SkippedRequest('Prazo do ciclo ou pausa TSE');
     // Reserve starts synchronously: at most 20 requests/second, max 8 in flight.
-    const wait = Math.max(0, nextStart - Date.now());
-    nextStart = Math.max(nextStart, Date.now()) + 50;
-    if (wait) await delay(Math.min(wait, Math.max(0, deadline - Date.now())));
+    const scheduledStart = Math.max(nextStart, Date.now());
+    nextStart = scheduledStart + 50;
+    // Never shorten the reserved pacing delay to fit the deadline: that would
+    // release several future requests together just before the cycle ends.
+    if (scheduledStart >= deadline) throw new SkippedRequest('Prazo do ciclo antes do próximo horário reservado');
+    while (Date.now() < scheduledStart) {
+      if (stopped()) throw new SkippedRequest('Prazo do ciclo ou pausa TSE');
+      await delay(scheduledStart - Date.now());
+    }
     if (stopped()) throw new SkippedRequest('Prazo do ciclo ou pausa TSE');
     started();
     const response = await fetchImpl(url, { signal: AbortSignal.timeout(Math.max(1, Math.min(8000, deadline - Date.now()))), cache: 'no-store',

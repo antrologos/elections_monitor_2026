@@ -54,7 +54,12 @@ test('municipal deadline bounds slow requests and stops queue', async () => {
     const start=Date.now();let requests=0;
     const out=await collectMunicipal({dataDir:dir,maxDurationMs:60,fetchImpl:async(_url,{signal})=>{
       requests++;
-      return new Promise((resolve,reject)=>signal.addEventListener('abort',()=>reject(Error('timeout')),{once:true}));
+      // The mock has no socket keeping Node alive; keep one referenced timer
+      // until AbortSignal fires, as a real pending fetch would.
+      return new Promise((resolve,reject)=>{
+        const guard=setTimeout(()=>reject(Error('abort missing')),1000);
+        signal.addEventListener('abort',()=>{clearTimeout(guard);reject(Error('timeout'));},{once:true});
+      });
     }});
     assert.ok(Date.now()-start<1000); assert.ok(requests<=2); assert.equal(out.deadlineReached,true);
     assert.equal(out.complete,false); assert.ok(out.errors.length<=2);
