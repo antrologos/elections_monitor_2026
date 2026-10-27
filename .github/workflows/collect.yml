@@ -10,18 +10,18 @@ on:
       - municipal.test.mjs
       - .github/workflows/collect.yml
   workflow_dispatch:
-  schedule:
-    - cron: '2-57/5 * * * *'
 
 permissions:
   contents: write
 
 concurrency:
   group: election-2026-data-collector
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: true
 
 jobs:
   collect:
+    # Interrompido a pedido do usuário em 2026-10-27.
+    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
