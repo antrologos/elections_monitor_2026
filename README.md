@@ -2,7 +2,7 @@
 
 Coletor público e independente de navegador para o segundo turno presidencial de 2026. Consulta a cada aproximadamente 60 segundos os dados oficiais do TSE para Brasil, 26 estados, Distrito Federal e Exterior, além do documento público integral do PET Apura. São 30 fontes principais. Os índices oficiais EA15 das 28 abrangências estaduais e Exterior identificam municípios atualizados; o coletor baixa incrementalmente seus resultados EA20, conservando uma fila entre ciclos. Municípios ainda não baixados aparecem como pendentes, sem cobertura fictícia.
 
-**Estado operacional: coleta desligada desde 27/10/2026.** Não existe agendamento cron ativo. Alterações no código executam somente testes. Os snapshots públicos são históricos; sua presença não indica uma execução ativa. O coletor não executa os modelos Rodrigo ou Histórico e Espacial: preserva dados oficiais e a projeção publicada pelo PET.
+**Estado operacional: coleta desligada desde 27/10/2026.** Não existe agendamento cron ativo. `operation.json` registra essa decisão explicitamente; o painel consulta esse arquivo antes de interpretar os snapshots. Alterações no código executam somente testes. Os snapshots públicos são históricos; sua presença não indica uma execução ativa. O coletor não executa os modelos Rodrigo ou Histórico e Espacial: preserva dados oficiais e a projeção publicada pelo PET.
 
 ## Operação e limites
 

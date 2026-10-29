@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "electionId": "6258",
+  "enabled": false,
+  "changedAt": "2026-10-27T18:50:23Z",
+  "reason": "Coleta interrompida por solicitação do responsável; nenhum agendamento ativo.",
+  "executionMode": "single-cycle",
+  "defaultWallTimeoutSeconds": 90,
+  "workflowJobTimeoutMinutes": 5,
+  "modelsExecuted": []
+}

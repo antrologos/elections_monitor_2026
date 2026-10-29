@@ -24,7 +24,7 @@ test('timeout kills a child ignoring TERM and its descendant',async()=>{
   assert.ok(performance.now()-start<3000);
   if(pid){
     try{const stat=await readFile(`/proc/${pid}/stat`,'utf8');assert.equal(stat.split(') ')[1][0],'Z','descendant must not still execute');}
-    catch(e){if(e.code!=='ENOENT')throw e;}
+    catch(e){if(!['ENOENT','ESRCH'].includes(e.code))throw e;}
   }
 });
 
