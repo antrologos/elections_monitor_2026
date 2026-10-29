@@ -1,50 +1,77 @@
-name: Coleta eleitoral independente
+name: Coletor eleitoral — verificação e execução limitada
 
 on:
   push:
     branches: [main]
     paths:
-      - collector.mjs
-      - collector.test.mjs
-      - municipal.mjs
-      - municipal.test.mjs
+      - '*.mjs'
+      - .github/workflows/collect.yml
+  pull_request:
+    paths:
+      - '*.mjs'
       - .github/workflows/collect.yml
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: election-2026-data-collector
+  group: election-2026-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  collect:
-    # Interrompido a pedido do usuário em 2026-10-27.
-    if: ${{ false }}
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 3
     steps:
       - name: Obter código
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2, official SHA verified
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
-          ref: main
+          persist-credentials: false
+      - name: Verificar comportamento, prazos e falhas
+        run: node --test collector.test.mjs municipal.test.mjs process.test.mjs
+  collect:
+    # Desligado desde 27/10. Não há cron. Verificação de código não coleta dados.
+    if: ${{ false }}
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Obter código
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
           fetch-depth: 0
-          persist-credentials: true
-      - name: Verificar coletor
-        run: node --test collector.test.mjs municipal.test.mjs
       - name: Preparar branch de dados separado
         shell: bash
         run: |
           set -euo pipefail
           data_dir="${RUNNER_TEMP}/elections-monitor-data"
-          if git ls-remote --exit-code --heads origin refs/heads/data >/dev/null 2>&1; then
-            git fetch origin refs/heads/data:refs/remotes/origin/data
-            git worktree add --detach "$data_dir" refs/remotes/origin/data
+          if timeout 20s git ls-remote --exit-code --heads origin refs/heads/data >/dev/null; then
+            timeout 30s git fetch origin refs/heads/data:refs/remotes/origin/data
+            timeout 15s git worktree add --detach "$data_dir" refs/remotes/origin/data
           else
-            git worktree add --detach "$data_dir" HEAD
-            git -C "$data_dir" switch --orphan collector-data
+            exit_code=$?
+            if [ "$exit_code" -ne 2 ]; then
+              echo "Falha ao consultar branch de dados (código $exit_code)" >&2
+              exit "$exit_code"
+            fi
+            timeout 15s git worktree add --detach "$data_dir" HEAD
+            timeout 15s git -C "$data_dir" switch --orphan collector-data
           fi
           echo "COLLECTOR_DATA_DIR=$data_dir" >> "$GITHUB_ENV"
-      - name: Coletar, preservar histórico e publicar a cada minuto
-        run: node collector.mjs --data-dir "$COLLECTOR_DATA_DIR" --duration-minutes 330 --publish
+      - name: Coletar e publicar um único ciclo
+        run: timeout --signal=TERM --kill-after=5s 100s node collector.mjs --data-dir "$COLLECTOR_DATA_DIR" --once --wall-timeout-seconds 90 --publish
+      - name: Registrar resultado mesmo em falha
+        if: always()
+        shell: bash
+        run: |
+          echo '## Resultado da coleta' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "${COLLECTOR_DATA_DIR:-/nonexistent}/.runtime/status.json" ]; then
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat "$COLLECTOR_DATA_DIR/.runtime/status.json" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'A coleta não chegou a iniciar; consulte a etapa de preparação.' >> "$GITHUB_STEP_SUMMARY"
+          fi

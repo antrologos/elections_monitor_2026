@@ -24,6 +24,16 @@ async function parallel(items, operation) {
   }));
 }
 class SkippedRequest extends Error {}
+// Reserving a slot is independent of timer precision and never compresses pacing.
+export function createStartScheduler(deadline, spacingMs=50) {
+  let nextStart=0;
+  return now => {
+    const start=Math.max(now,nextStart);
+    if(start>=deadline)return null;
+    nextStart=start+spacingMs;
+    return start;
+  };
+}
 // TSE timestamps are compared in their own common civil timezone, not to host time.
 export function tseStamp(date, time) {
   if (!date && !time) return '';
@@ -69,8 +79,9 @@ export function validateMunicipal(body, entry) {
 }
 
 export async function collectMunicipal({ dataDir, fetchImpl = fetch, now = Date.now, maxMunicipal = 600,
-  tseBlockedUntil = null, maxDurationMs = 25000, isBlocked = () => false, onBlocked = () => {} }) {
-  const deadline = Date.now() + maxDurationMs;
+  tseBlockedUntil = null, maxDurationMs = 25000, isBlocked = () => false, onBlocked = () => {}, signal, clock = () => performance.now() }) {
+  const deadline = clock() + maxDurationMs;
+  let deadlineReached = false;
   const statePath = resolve(dataDir, 'data/municipal-state.json');
   const old = await readJson(statePath);
   const state = old?.electionId === '6258' ? old : { schemaVersion: 1, electionId: '6258', entries: {}, cursor: 0 };
@@ -79,23 +90,23 @@ export async function collectMunicipal({ dataDir, fetchImpl = fetch, now = Date.
   if (blockedUntil > now()) return { ...state.summary, lastAttemptAt: attemptedAt,
     skipped: true, complete: false, tseBlockedUntil: new Date(blockedUntil).toISOString(),
     errors: [{ source: 'tse-index', error: 'TSE em pausa após bloqueio HTTP' }] };
-  let nextStart = 0, manifestSuccessful = 0, updatedMunicipalities = 0, requestedMunicipalities = 0;
-  const stopped = () => blockedUntil > now() || isBlocked() || Date.now() >= deadline;
+  const reserveStart=createStartScheduler(deadline);
+  let manifestSuccessful = 0, updatedMunicipalities = 0, requestedMunicipalities = 0;
+  const stopped = () => signal?.aborted || blockedUntil > now() || isBlocked() || clock() >= deadline;
   async function get(url, started = () => {}) {
     if (stopped()) throw new SkippedRequest('Prazo do ciclo ou pausa TSE');
     // Reserve starts synchronously: at most 20 requests/second, max 8 in flight.
-    const scheduledStart = Math.max(nextStart, Date.now());
-    nextStart = scheduledStart + 50;
+    const scheduledStart = reserveStart(clock());
     // Never shorten the reserved pacing delay to fit the deadline: that would
     // release several future requests together just before the cycle ends.
-    if (scheduledStart >= deadline) throw new SkippedRequest('Prazo do ciclo antes do próximo horário reservado');
-    while (Date.now() < scheduledStart) {
+    if (scheduledStart === null) { deadlineReached=true; throw new SkippedRequest('Prazo do ciclo antes do próximo horário reservado'); }
+    while (clock() < scheduledStart) {
       if (stopped()) throw new SkippedRequest('Prazo do ciclo ou pausa TSE');
-      await delay(scheduledStart - Date.now());
+      await delay(scheduledStart - clock(), undefined, {signal});
     }
     if (stopped()) throw new SkippedRequest('Prazo do ciclo ou pausa TSE');
     started();
-    const response = await fetchImpl(url, { signal: AbortSignal.timeout(Math.max(1, Math.min(8000, deadline - Date.now()))), cache: 'no-store',
+    const response = await fetchImpl(url, { signal: AbortSignal.any([...(signal?[signal]:[]),AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(8000, deadline - clock()))))]), cache: 'no-store',
       headers: { Accept: 'application/json', 'Cache-Control': 'no-cache', 'User-Agent': 'elections-monitor-2026/1.0' } });
     if (response.status === 403 || response.status === 429) { blockedUntil = now() + 600_000; onBlocked(); }
     if (!response.ok) throw Error(`HTTP ${response.status}`);
@@ -154,9 +165,11 @@ export async function collectMunicipal({ dataDir, fetchImpl = fetch, now = Date.
     pendingMunicipalities, manifestSuccessful, manifestExpected: UFS.length, errors,
     tseBlockedUntil: blockedUntil > now() ? new Date(blockedUntil).toISOString() : null,
     pauseUntil: blockedUntil > now() ? new Date(blockedUntil).toISOString() : null,
-    deadlineReached: Date.now() >= deadline,
+    deadlineReached: deadlineReached || clock() >= deadline,
     complete: manifestSuccessful === UFS.length && knownMunicipalities > 0 && pendingMunicipalities === 0 && !errors.length };
+  signal?.throwIfAborted();
   state.summary = summary;
   await writeJson(statePath, state);
   return summary;
 }
+

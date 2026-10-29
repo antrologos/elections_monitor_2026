@@ -84,12 +84,13 @@ test('data commits publish atomically on separate branch and retain previous ver
     git(root, ['init', '--bare', bare]); git(root, ['init', local]);
     git(local, ['remote', 'add', 'origin', bare]);
     await mkdir(join(local, 'data')); await writeFile(join(local, 'data/heartbeat.json'), '{"version":1}\n');
-    gitPublish(local, 'first');
+    await gitPublish(local, 'first');
     await writeFile(join(local, 'data/heartbeat.json'), '{"version":2}\n');
-    gitPublish(local, 'second'); gitPublish(local, 'retry-with-clean-tree');
+    await gitPublish(local, 'second'); await gitPublish(local, 'retry-with-clean-tree');
     assert.equal(git(bare, ['rev-list', '--count', 'data']).trim(), '2');
     assert.equal(JSON.parse(git(bare, ['show', 'data:data/heartbeat.json'])).version, 2);
     assert.equal(JSON.parse(git(bare, ['show', 'data~1:data/heartbeat.json'])).version, 1);
     assert.equal(git(bare, ['for-each-ref', '--format=%(refname)']).trim(), 'refs/heads/data');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+

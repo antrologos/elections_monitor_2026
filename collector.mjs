@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { runCommand, safeError } from './process.mjs';
+import { appendFileSync, mkdirSync, writeFileSync, renameSync } from 'node:fs';
 import { setTimeout as delay } from 'node:timers/promises';
 import { collectMunicipal } from './municipal.mjs';
 
@@ -61,11 +62,12 @@ export function envelope(source, previous, outcome, attemptedAt) {
     lastAttemptAt: attemptedAt, error: outcome.error };
 }
 
-export async function fetchSource(source, fetchImpl = fetch, onBlocked = () => {}) {
+export async function fetchSource(source, fetchImpl = fetch, onBlocked = () => {}, signal) {
   let failure;
   for (let attempt = 0; attempt < 2; attempt++) {
+    signal?.throwIfAborted();
     try {
-      const response = await fetchImpl(source.url, { signal: AbortSignal.timeout(8000), cache: 'no-store',
+      const response = await fetchImpl(source.url, { signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(8000)]) : AbortSignal.timeout(8000), cache: 'no-store',
         headers: { Accept: 'application/json', 'Cache-Control': 'no-cache', 'User-Agent': 'elections-monitor-2026/1.0' } });
       if (response.status === 403 || response.status === 429) {
         if (source.kind === 'tse') onBlocked();
@@ -74,7 +76,7 @@ export async function fetchSource(source, fetchImpl = fetch, onBlocked = () => {
       if (!response.ok) throw Error(`HTTP ${response.status}`);
       const body = validate(source, await response.json());
       return { ok: true, body, checkedAt: new Date().toISOString() };
-    } catch (error) { failure = message(error); if (attempt === 0) await delay(500); }
+    } catch (error) { failure = message(error); if (attempt === 0) await delay(500, undefined, {signal}); }
   }
   return { ok: false, error: failure };
 }
@@ -117,14 +119,16 @@ async function parallel(items, concurrency, operation) {
   return results;
 }
 
-export async function collectCycle({ dataDir, fetchImpl = fetch, now = Date.now, runUrl = null, includeMunicipal = false }) {
+export async function collectCycle({ dataDir, fetchImpl = fetch, now = Date.now, runUrl = null, includeMunicipal = false, signal, onProgress = () => {} }) {
+  signal?.throwIfAborted();
+  onProgress('sources');
   const previous = await json(resolve(dataDir, 'data/heartbeat.json'));
   const attemptedAt = iso(now());
   let tseBlockedUntil = Date.parse(previous?.tseBlockedUntil) || 0;
   const outcomes = await parallel(SOURCES, 8, source => {
     if (source.kind === 'tse' && tseBlockedUntil > now())
       return { ok: false, error: `TSE em pausa por bloqueio HTTP até ${iso(tseBlockedUntil)}` };
-    return fetchSource(source, fetchImpl, () => { tseBlockedUntil = now() + 600_000; });
+    return fetchSource(source, fetchImpl, () => { tseBlockedUntil = now() + 600_000; }, signal);
   });
   for (let i = 0; i < SOURCES.length; i++) {
     const source = SOURCES[i], path = resolve(dataDir, `data/${source.id}.json`);
@@ -133,7 +137,8 @@ export async function collectCycle({ dataDir, fetchImpl = fetch, now = Date.now,
   let municipal = previous?.municipal ?? null;
   if (includeMunicipal) {
     try {
-      municipal = await collectMunicipal({ dataDir, fetchImpl, now, maxMunicipal: 600,
+      onProgress('municipal');
+      municipal = await collectMunicipal({ dataDir, fetchImpl, now, signal, maxMunicipal: 600,
         maxDurationMs: 25_000, budgetMs: 25_000,
         isBlocked: () => tseBlockedUntil > now(), onBlocked: () => { tseBlockedUntil = now() + 600_000; } });
     } catch (error) {
@@ -141,6 +146,8 @@ export async function collectCycle({ dataDir, fetchImpl = fetch, now = Date.now,
         errors: [{ source: 'municipal-collector', error: message(error) }] };
     }
   }
+  signal?.throwIfAborted();
+  onProgress('persist_local');
   const successfulSources = outcomes.filter(x => x.ok).length, finished = now();
   const status = completion(previous?.completion, outcomes[0], successfulSources === SOURCES.length && (!includeMunicipal || municipal?.complete), finished);
   const heartbeat = { schemaVersion: 1, election: ELECTION, collectionMode: 'github-actions',
@@ -156,49 +163,87 @@ export async function collectCycle({ dataDir, fetchImpl = fetch, now = Date.now,
   return heartbeat;
 }
 
-export function gitPublish(dataDir, timestamp) {
-  const git = args => execFileSync('git', args, { cwd: dataDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-  git(['add', '--', 'data']);
-  if (git(['status', '--porcelain']).trim())
-    git(['-c', 'user.name=elections-monitor[bot]', '-c', 'user.email=elections-monitor[bot]@users.noreply.github.com',
-      'commit', '-m', `Coleta ${timestamp}`]);
-  // No forced push: code lives on main and data is serialized by workflow concurrency.
-  git(['push', 'origin', 'HEAD:refs/heads/data']);
+export async function gitPublish(dataDir, timestamp, { signal, timeoutMs=15000, onEvent } = {}) {
+  const git = async args => (await runCommand('git',args,{cwd:dataDir,timeoutMs,signal,onEvent})).stdout;
+  await git(['add','--','data']);
+  if ((await git(['status','--porcelain','--','data'])).trim())
+    await git(['-c','user.name=elections-monitor[bot]','-c','user.email=elections-monitor[bot]@users.noreply.github.com',
+      'commit','-m',`Coleta ${timestamp}`,'--','data']);
+  await git(['push','origin','HEAD:refs/heads/data']);
 }
 
-export async function main(args = process.argv.slice(2)) {
-  const option = (name, fallback) => { const index = args.indexOf(name); return index < 0 ? fallback : args[index + 1]; };
-  const dataDir = resolve(option('--data-dir', '.'));
-  const duration = Number(option('--duration-minutes', '330'));
-  if (!(duration > 0 && duration <= 330)) throw Error('Duração deve estar entre 0 e 330 minutos');
-  const publish = args.includes('--publish'), once = args.includes('--once');
-  const deadline = Date.now() + duration * 60_000;
-  const runUrl = process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
-    ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}` : null;
-  let stopping = false;
-  process.once('SIGTERM', () => { stopping = true; });
-  process.once('SIGINT', () => { stopping = true; });
-  while (!stopping && Date.now() < deadline) {
-    const start = Date.now(), heartbeat = await collectCycle({ dataDir, runUrl, includeMunicipal: true });
-    if (publish) {
-      let published = false;
-      for (let attempt = 0; attempt < 3 && !published; attempt++) {
-        try {
-          gitPublish(dataDir, heartbeat.lastAttemptAt);
-          published = true;
-        } catch {
-          if (attempt === 2) throw Error('Falha ao persistir snapshots no branch data após três tentativas.');
-          await delay(5000);
+export async function main(args = process.argv.slice(2), { fetchImpl=fetch, publishImpl=gitPublish, collectImpl=collectCycle } = {}) {
+  const options=new Map();
+  const allowed=new Set(['--data-dir','--duration-minutes','--wall-timeout-seconds','--publish','--once']);
+  for(let i=0;i<args.length;i++){
+    const name=args[i];
+    if(!allowed.has(name))throw Error(`Unknown option: ${name}`);
+    if(options.has(name))throw Error(`Duplicate option: ${name}`);
+    if(['--publish','--once'].includes(name)){options.set(name,true);continue;}
+    const value=args[++i];
+    if(!value||value.startsWith('--'))throw Error(`Missing value for ${name}`);
+    options.set(name,value);
+  }
+  const option=(name,fallback)=>options.get(name)??fallback;
+  const dataDir=resolve(option('--data-dir','.'));
+  const duration=Number(option('--duration-minutes','1'));
+  const wall=Number(option('--wall-timeout-seconds','90'));
+  if(!(duration>0&&duration<=5&&wall>0&&wall<=360))throw Error('Duração máxima: 5 minutos; limite total: 360 segundos');
+  const once=args.includes('--once')||!args.includes('--duration-minutes'),publish=args.includes('--publish');
+  const runtime=resolve(dataDir,'.runtime');mkdirSync(runtime,{recursive:true});
+  const statusFile=resolve(runtime,'status.json'),eventFile=resolve(runtime,'events.jsonl');
+  const began=performance.now(),controller=new AbortController();
+  let state={schemaVersion:1,runId:`${Date.now()}-${process.pid}`,pid:process.pid,state:'running',phase:'starting',
+    startedAt:new Date().toISOString(),cycles:0,publishRequested:publish,lastError:null};
+  const record=(event,fields={})=>{
+    state={...state,...fields,updatedAt:new Date().toISOString(),elapsedSeconds:(performance.now()-began)/1000,event};
+    writeFileSync(statusFile+'.tmp',JSON.stringify(state)+'\n');renameSync(statusFile+'.tmp',statusFile);
+    const line=JSON.stringify({event,...state});appendFileSync(eventFile,line+'\n');console.log(line);
+  };
+  const stop=()=>controller.abort(Error('Cancelled by signal'));
+  process.once('SIGTERM',stop);process.once('SIGINT',stop);
+  const deadline=setTimeout(()=>controller.abort(Error('Run wall-time limit exceeded')),wall*1000);
+  const pulse=setInterval(()=>record('heartbeat'),5000);
+  const runUrl=process.env.GITHUB_RUN_ID?`${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`:null;
+  record('run_started');
+  try {
+    do {
+      controller.signal.throwIfAborted();
+      const cycleStart=performance.now();
+      const signal=AbortSignal.any([controller.signal,AbortSignal.timeout(Math.min(75000,wall*1000))]);
+      const heartbeat=await collectImpl({dataDir,fetchImpl,runUrl,includeMunicipal:true,signal,
+        onProgress:phase=>record('phase_changed',{phase})});
+      if(publish){
+        record('phase_changed',{phase:'publishing'});
+        // Retries retain the original error and share the run deadline.
+        for(let attempt=1;attempt<=3;attempt++){
+          controller.signal.throwIfAborted();
+          try{await publishImpl(dataDir,heartbeat.lastAttemptAt,{signal:controller.signal,
+            onEvent:e=>record(e.event,{lastCommand:e})});break;}
+          catch(error){record('publish_failed',{attempt,lastError:safeError(error),commandResult:error.result?
+            {...error.result,stdout:undefined,stderr:safeError(error.result.stderr)}:null});
+            if(attempt===3||error.result?.reason||controller.signal.aborted)throw error;
+            await delay(1000,undefined,{signal:controller.signal});}
         }
       }
-    }
-    console.log(JSON.stringify({ checkedAt: heartbeat.checkedAt, successfulSources: heartbeat.successfulSources,
-      expectedSources: heartbeat.expectedSources, completion: heartbeat.completion.status, persisted: publish }));
-    if (once || heartbeat.completion.completed || stopping) break;
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    await delay(Math.min(Math.max(0, 60_000 - (Date.now() - start)), remaining));
+      record('cycle_finished',{cycles:state.cycles+1,phase:'cycle_complete',successfulSources:heartbeat.successfulSources,
+        expectedSources:heartbeat.expectedSources,lastSuccessfulCollectionAt:heartbeat.checkedAt});
+      if(heartbeat.successfulSources!==heartbeat.expectedSources||heartbeat.municipal?.errors?.length)
+        throw Error(`Incomplete collection: ${JSON.stringify({sources:heartbeat.errors,municipal:heartbeat.municipal?.errors}).slice(0,12000)}`);
+      if(once||heartbeat.completion.completed||performance.now()-began>=duration*60000)break;
+      record('phase_changed',{phase:'waiting_for_next_cycle'});
+      await delay(Math.min(Math.max(0,60000-(performance.now()-cycleStart)),Math.max(0,duration*60000-(performance.now()-began))),undefined,{signal:controller.signal});
+    }while(performance.now()-began<duration*60000);
+    record('run_finished',{state:'succeeded',phase:'finished',lastError:null});
+    return state;
+  }catch(error){
+    const timedOut=controller.signal.reason?.message==='Run wall-time limit exceeded'||error.name==='TimeoutError';
+    record('run_finished',{state:timedOut?'timed_out':controller.signal.aborted?'stopped':'failed',
+      failedPhase:state.phase,phase:'finished',lastError:safeError(controller.signal.reason||error)});
+    throw error;
+  }finally{
+    clearTimeout(deadline);clearInterval(pulse);process.removeListener('SIGTERM',stop);process.removeListener('SIGINT',stop);
   }
 }
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url))
-  main().catch(error => { console.error(message(error)); process.exitCode = 1; });
+  main().catch(error => { console.error(safeError(error)); process.exitCode = 1; });
